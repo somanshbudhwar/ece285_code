@@ -5,11 +5,16 @@ import h5py
 import numpy as np
 
 import torch
+from matplotlib import pyplot as plt
+
 from common.model import Tacotron2
 from common.logger import Tacotron2Logger
 from common.hparams_monadic import create_hparams
 from torch.utils.data import DataLoader
 from common.loss_function import Tacotron2Loss
+from common.model2 import VAE
+from common.model2 import Seq2SeqLSTM
+from common.model2 import MLP
 
 
 class SpeechGestureDataset_Monadic(torch.utils.data.Dataset):
@@ -204,15 +209,33 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
                 'learning_rate': learning_rate}, filepath)
 
 
-def validate(model, criterion, val_loader, iteration, logger, teacher_prob):
+def validate(model, criterion, val_loader, iteration, logger, teacher_prob, lstm, mlp):
     """Handles all the validation scoring and printing"""
-    model.eval()
+    lstm.eval()
+    mlp.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with torch.no_grad():
         val_loss = 0.0
         for i, batch in enumerate(val_loader):
             x, y = model.parse_batch(batch)
-            y_pred = model(x, teacher_prob)
-            loss = criterion(y_pred, y)
+
+            data = x[0].unsqueeze(1).to(device)
+            data = data.squeeze(1).permute(0, 2, 1)
+
+            y_pred = lstm.predict(data)
+
+            batch_size = y_pred.size(0)
+            seq_len = y_pred.size(1)
+            n_feat = y_pred.size(2)
+
+
+            #y_pred = mlp(torch.reshape(y_pred, (batch_size*seq_len, n_feat)))
+            #y_pred = torch.reshape(y_pred, (batch_size, seq_len, n_feat))
+            y = y[0].permute(0, 2, 1)
+
+
+
+            loss = criterion(y_pred, y[0])
             reduced_val_loss = loss.item()
             val_loss += reduced_val_loss
             print("Iteration {} ValLoss {:.6f}  ".format(i, val_loss/(i+1)), end="\r")
@@ -221,8 +244,11 @@ def validate(model, criterion, val_loader, iteration, logger, teacher_prob):
         val_loss = val_loss / (i + 1)
 
     model.train()
+    lstm.train()
+    mlp.train()
     print("Validation Loss: {:9f}     ".format(val_loss))
-    logger.log_validation(val_loss, model, y, y_pred, iteration)
+    return val_loss
+    # logger.log_validation(val_loss, model, y, y_pred, iteration)
 
 
 def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
@@ -234,31 +260,46 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
     torch.manual_seed(hparams.seed)
     torch.cuda.manual_seed(hparams.seed)
 
+    latent_dim = 128
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model = load_model(hparams)
+    # vae = VAE(latent_dim).to(device)
+    lstm = Seq2SeqLSTM(427, 78, 78).to(device)
+    mlp = MLP().to(device)
+
     learning_rate = hparams.learning_rate
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=hparams.weight_decay)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=hparams.weight_decay)
+    optimizer = torch.optim.Adam(lstm.parameters(), lr=learning_rate, weight_decay=hparams.weight_decay)
+    optimizer_mlp = torch.optim.Adam(mlp.parameters(), lr=learning_rate, weight_decay=hparams.weight_decay)
 
 
-    criterion = Tacotron2Loss(hparams.mel_weight, hparams.gate_weight, hparams.vel_weight, hparams.pos_weight, hparams.add_l1_losss)
+    # criterion = Tacotron2Loss(hparams.mel_weight, hparams.gate_weight, hparams.vel_weight, hparams.pos_weight, hparams.add_l1_losss)
+    criterion = torch.nn.MSELoss(reduction='sum')
     logger = prepare_directories_and_logger(output_directory, log_directory)
 
     train_loader, val_loader = prepare_dataloaders(hparams)
 
     # Load checkpoint if one exists
     iteration = 0
-    if checkpoint_path:
-        if warm_start: # set to False
-            model = warm_start_model(checkpoint_path, model)
-        else:
-            model, optimizer, _learning_rate, iteration = load_checkpoint(checkpoint_path, model, optimizer)
-            if hparams.use_saved_learning_rate:
-                learning_rate = _learning_rate
-            # iteration += 1  # next iteration is iteration + 1
+    # if checkpoint_path:
+    #     if warm_start: # set to False
+    #         model = warm_start_model(checkpoint_path, model)
+    #     else:
+    #         model, optimizer, _learning_rate, iteration = load_checkpoint(checkpoint_path, model, optimizer)
+    #         if hparams.use_saved_learning_rate:
+    #             learning_rate = _learning_rate
+    #         # iteration += 1  # next iteration is iteration + 1
 
     reduced_loss = 0.
     duration = 0.
     teacher_prob = 1.
     model.train()
+    # lstm = torch.load('lstm3')
+    mlp.train()
+    lstm.train()
+    losses_exp = []
+    val_losses = []
 
     # ================ MAIN TRAINNIG LOOP! ===================
     for i, batch in enumerate(train_loader):
@@ -266,16 +307,39 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
         for param_group in optimizer.param_groups:
             param_group['lr'] = learning_rate
 
-        model.zero_grad()
+        # model.zero_grad()
+        optimizer.zero_grad()
         x, y = model.parse_batch(batch)
-        y_pred = model(x, teacher_prob)
+        # y_pred = VAE(x[0])
+        data = x[0].unsqueeze(1).to(device)
+        # mean, logvar = vae.encoder(data)
+        # z = vae.reparameterize(mean, logvar)
+        # y_pred = vae.decoder(z)
+        target = y[0].permute(0,2,1)
+        real_target = y[0].permute(0,2,1)
 
-        loss = criterion(y_pred, y)
+        batch_size = target.size(0)
+        seq_len = target.size(1)
+        n_feat = target.size(2)
+
+        real_target = torch.reshape(real_target, (batch_size*seq_len, n_feat))
+
+
+        data = data.squeeze(1).permute(0,2,1)
+        y_pred = lstm(data, target)
+
+        loss = criterion(y_pred, target)
+
         reduced_loss += loss.item()
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip_thresh)
         optimizer.step()
+
+        #y_pred = mlp(real_target)
+        #loss = criterion(y_pred, real_target)
+        #loss.backward()
+        #optimizer_mlp.step()
 
         iters_from_last_save = iteration % hparams.iters_per_checkpoint + 1
         running_loss = reduced_loss/iters_from_last_save
@@ -290,17 +354,29 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
             print()
             duration = 0.
             reduced_loss = 0.
-            validate(model, criterion, val_loader, iteration + 1, logger, teacher_prob)
-            checkpoint_path = os.path.join(output_directory, "ckpt", "checkpoint_{}.pt".format(iteration + 1))
-            save_checkpoint(model, optimizer, learning_rate, iteration + 1, checkpoint_path)
+            # validate(model, criterion, val_loader, iteration + 1, logger, teacher_prob)
+            val_loss = validate(model, criterion, val_loader, iteration + 1, logger, teacher_prob, lstm, mlp)
+            val_losses.append(val_loss)
+            # checkpoint_path = os.path.join(output_directory, "ckpt", "checkpoint_{}.pt".format(iteration + 1))
+            # save_checkpoint(model, optimizer, learning_rate, iteration + 1, checkpoint_path)
 
         iteration += 1
+        if iteration % 50 == 0:
+            losses_exp.append(running_loss)
+            #torch.save(lstm, "lstm5")
+            #torch.save(mlp, "mlp")
+        if iteration > 1000:
+            plt.plot(losses_exp)
+            plt.plot(val_losses)
+            plt.legend(['Training Loss', 'Validation Loss'])
+            plt.savefig('loss_curve')
+            break
 
 
 if __name__ == '__main__':
     hparams = create_hparams()
 
-    torch.cuda.set_device("cuda:{}".format(hparams.device))
+    torch.cuda.set_device("cuda:0")
     torch.backends.cudnn.enabled = hparams.cudnn_enabled
     torch.backends.cudnn.benchmark = hparams.cudnn_benchmark
 

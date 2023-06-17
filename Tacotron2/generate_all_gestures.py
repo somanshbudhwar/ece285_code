@@ -18,8 +18,8 @@ from scipy.signal import savgol_filter
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-f', "--h5file", type=str, default="../val_main-agent_v0.h5")
-parser.add_argument('-ch', "--checkpoint_path", type=str, required=True)
+parser.add_argument('-f', "--h5file", type=str, default="val_main-agent_v0.h5")
+parser.add_argument('-ch', "--checkpoint_path", type=str, default="monadic/ckpt/checkpoint_2000.pt",required=False)
 parser.add_argument('-o', "--output_dir", type=str, default="outputs")
 parser.add_argument('-t', "--track", type=str, default="full", help="The track for the bvh files. Can only be either 'full' or 'upper'")
 # parser.add_argument('-p', "--pipeline", default="../pipeline_expmap_full.sav", type=str)
@@ -76,10 +76,26 @@ for index in tqdm(range(len(h5.keys()))):
 
 	### Inference
 	with torch.no_grad():
-		y_pred = model.inference(audiotext)
-		_, predicted_gesture, _, _ = y_pred
-		predicted_gesture = predicted_gesture.squeeze(0).transpose(0, 1).cpu().detach().numpy()
+		# y_pred = model.inference(audiotext)
+		# _, predicted_gesture, _, _ = y_pred
+		# vae = torch.load('vae')
+		# data = audiotext.unsqueeze(1)
 
+		data = audiotext.permute(0, 2, 1)
+		lstm = torch.load('lstm5')
+
+		y_pred = lstm.predict(data)
+
+		# y_pred = torch.zeros((1,78,1800))
+		#
+		# for i in range(0, y_pred.shape[-1], 300):
+		# 	mean, logvar = vae.encoder(data[:, :, :, i:i + 300])
+		# 	z = vae.reparameterize(mean, logvar)
+		# 	y_pred[:, :, i:i + 300] = vae.decoder(z)
+
+		predicted_gesture = y_pred
+		# predicted_gesture = predicted_gesture.squeeze(0).transpose(0, 1).cpu().detach().numpy()
+		predicted_gesture = predicted_gesture.squeeze(0).cpu().detach().numpy()
 	# todo: convert to bvh and save to output folder
 	predicted_gesture = savgol_filter(predicted_gesture, 9, 3, axis=0)
 	# print(predicted_gesture.shape)
